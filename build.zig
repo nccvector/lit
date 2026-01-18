@@ -55,14 +55,19 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
+    // Test filter option
+    const test_filter = b.option([]const u8, "test-filter", "Filter tests by name");
+
     // Test step
     const mod_tests = b.addTest(.{
         .root_module = lit_mod,
+        .filters = if (test_filter) |f| &.{f} else &.{},
     });
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
+        .filters = if (test_filter) |f| &.{f} else &.{},
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
