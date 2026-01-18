@@ -1,0 +1,19 @@
+.{
+    .name = .lit,
+    .version = "0.0.0",
+    .fingerprint = 0x5ddb8e9d7a7390a5,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .lmao = .{
+            .path = "../lmao",
+        },
+        .chad = .{
+            .path = "../chad",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

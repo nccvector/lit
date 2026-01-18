@@ -1,0 +1,13 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
+# Output files
+*.ppm
+
+# IDE
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
