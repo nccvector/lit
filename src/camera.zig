@@ -50,9 +50,9 @@ pub fn Camera(comptime T: type) type {
         pub fn fromIntrinsics(fx: T, fy: T, cx: T, cy: T, image_width: u32, image_height: u32) Self {
             return .{
                 .K = Mat3.fromArray(&.{
-                    fx,  0,   cx,
-                    0,   fy,  cy,
-                    0,   0,   1,
+                    fx, 0,  cx,
+                    0,  fy, cy,
+                    0,  0,  1,
                 }),
                 .transform = Mat4.identity(),
                 .image_width = image_width,
@@ -143,7 +143,7 @@ pub fn Camera(comptime T: type) type {
             // K_inv maps pixel coords to a point on the z=1 plane in camera space
             // Negate the entire direction to point into the scene (-Z forward convention)
             const dir_camera_inv = K_inv.dotSIMD(pixel_homogeneous).normalized();
-            const dir_camera = Vec3.fromArray(&.{dir_camera_inv.data[0], -dir_camera_inv.data[1], -dir_camera_inv.data[2]});
+            const dir_camera = Vec3.fromArray(&.{ dir_camera_inv.data[0], -dir_camera_inv.data[1], -dir_camera_inv.data[2] });
 
             // Transform direction and origin to world space
             const dir_world = self.transform.transformDirection(dir_camera).normalized();
