@@ -254,14 +254,14 @@ test "basic rendering" {
     try std.testing.expect(cam.image_buffer != null);
 }
 
-test "camera center check" {
+test "camera center 3x3" {
     const allocator = std.testing.allocator;
 
     // Sphere of radius 1.0 at world origin
     const sphere = Sphere.init(Vec3.fromArray(&.{ 0, 0, 0 }), 2.0);
 
     // Camera at (5, 0, 0) looking at origin, 45 degree FOV, 3x3 image
-    var camera = Camera32.fromFOV(45.0, 8, 8);
+    var camera = Camera32.fromFOV(45.0, 3, 3);
     camera.lookAt(
         Vec3.fromArray(&.{ 0, 0, 5 }), // eye - on positive X axis
         Vec3.fromArray(&.{ 0, 0, 0 }), // target - origin (sphere center)
@@ -300,20 +300,191 @@ test "camera center check" {
     }
 
     // Save output to PPM file
-    try lit.writePPM("camera_center_check.ppm", camera.image_buffer.?, camera.image_width, camera.image_height);
+    try lit.writePPM("camera_center_3x3.ppm", camera.image_buffer.?, camera.image_width, camera.image_height);
 
-    // // Verify center ray hits the sphere
-    // // Principal point is at (cx, cy) = ((width-1)/2, (height-1)/2) = (1.0, 1.0)
-    // const center_ray = camera.getRay(1.0, 1.0);
-    // const center_hit = sphere.intersectRay(center_ray);
-    // try std.testing.expect(center_hit != null);
+    // Helper to get pixel intensity (R channel, since grayscale R=G=B)
+    const buf = camera.image_buffer.?;
+    const getPixel = struct {
+        fn get(buffer: []u8, x: usize, y: usize, width: usize) u8 {
+            const idx = (y * width + x) * 3;
+            return buffer[idx];
+        }
+    }.get;
 
-    // // Verify ray direction is correct (should point directly at origin from camera at (5,0,0))
-    // try std.testing.expectApproxEqAbs(@as(f32, -1.0), center_ray.direction.data[0], 0.001);
-    // try std.testing.expectApproxEqAbs(@as(f32, 0.0), center_ray.direction.data[1], 0.001);
-    // try std.testing.expectApproxEqAbs(@as(f32, 0.0), center_ray.direction.data[2], 0.001);
+    // Verify plus shape pattern:
+    // The center cross (vertical and horizontal lines) should hit the sphere (non-zero)
+    // The corners should miss the sphere (zero)
 
-    // // Verify hit distance (camera at x=5, sphere center at origin with radius 1.0)
-    // // Expected hit distance: 5 - 1.0 = 4.0
-    // try std.testing.expectApproxEqAbs(@as(f32, 4.0), center_hit.?.t, 0.001);
+    // Center pixel (1,1) - must hit
+    try std.testing.expect(getPixel(buf, 1, 1, 3) > 0);
+
+    // Horizontal line through center: (0,1) and (2,1) - must hit
+    try std.testing.expect(getPixel(buf, 0, 1, 3) > 0);
+    try std.testing.expect(getPixel(buf, 2, 1, 3) > 0);
+
+    // Vertical line through center: (1,0) and (1,2) - must hit
+    try std.testing.expect(getPixel(buf, 1, 0, 3) > 0);
+    try std.testing.expect(getPixel(buf, 1, 2, 3) > 0);
+
+    // Corners should be zero (miss the sphere)
+    try std.testing.expectEqual(@as(u8, 0), getPixel(buf, 0, 0, 3)); // top-left
+    try std.testing.expectEqual(@as(u8, 0), getPixel(buf, 2, 0, 3)); // top-right
+    try std.testing.expectEqual(@as(u8, 0), getPixel(buf, 0, 2, 3)); // bottom-left
+    try std.testing.expectEqual(@as(u8, 0), getPixel(buf, 2, 2, 3)); // bottom-right
+}
+
+test "camera center 4x4" {
+    const allocator = std.testing.allocator;
+
+    // Sphere of radius 2.0 at world origin
+    const sphere = Sphere.init(Vec3.fromArray(&.{ 0, 0, 0 }), 2.0);
+
+    // Camera at (0, 0, 5) looking at origin, 45 degree FOV, 4x4 image
+    var camera = Camera32.fromFOV(45.0, 4, 4);
+    camera.lookAt(
+        Vec3.fromArray(&.{ 0, 0, 5 }), // eye - on positive Z axis
+        Vec3.fromArray(&.{ 0, 0, 0 }), // target - origin (sphere center)
+        Vec3.fromArray(&.{ 0, 1, 0 }), // up
+    );
+
+    // Allocate image buffer
+    try camera.allocateImageBuffer(allocator);
+    defer camera.freeImageBuffer();
+
+    // Render the 4x4 image
+    for (0..camera.image_height) |y| {
+        for (0..camera.image_width) |x| {
+            const pixel_x: f32 = @floatFromInt(x);
+            const pixel_y: f32 = @floatFromInt(y);
+
+            // Generate ray for this pixel
+            const ray = camera.getRay(pixel_x, pixel_y);
+
+            // Test sphere intersection
+            if (sphere.intersectRay(ray)) |hit| {
+                // Shade based on normal
+                const light_dir = Vec3.fromArray(&.{ 0, 0, 1 }).normalized();
+                const ndotl = @max(0.0, hit.normal.dotProduct(light_dir));
+                const shade = @abs(ndotl);
+
+                const intensity: u8 = @intFromFloat(@min(255.0, 255.0 * shade));
+                camera.setPixel(@intCast(x), @intCast(y), intensity, intensity, intensity);
+            } else {
+                // Black background
+                camera.setPixel(@intCast(x), @intCast(y), 0, 0, 0);
+            }
+        }
+    }
+
+    // Save output to PPM file
+    try lit.writePPM("camera_center_4x4.ppm", camera.image_buffer.?, camera.image_width, camera.image_height);
+
+    // Helper to get pixel intensity (R channel, since grayscale R=G=B)
+    const buf = camera.image_buffer.?;
+    const getPixel = struct {
+        fn get(buffer: []u8, x: usize, y: usize, width: usize) u8 {
+            const idx = (y * width + x) * 3;
+            return buffer[idx];
+        }
+    }.get;
+
+    // Verify center 2x2 grid (pixels (1,1), (2,1), (1,2), (2,2)) are non-zero and equal
+    const center_tl = getPixel(buf, 1, 1, 4); // top-left of center 2x2
+    const center_tr = getPixel(buf, 2, 1, 4); // top-right of center 2x2
+    const center_bl = getPixel(buf, 1, 2, 4); // bottom-left of center 2x2
+    const center_br = getPixel(buf, 2, 2, 4); // bottom-right of center 2x2
+
+    // All center pixels must be non-zero (hit the sphere)
+    try std.testing.expect(center_tl > 0);
+    try std.testing.expect(center_tr > 0);
+    try std.testing.expect(center_bl > 0);
+    try std.testing.expect(center_br > 0);
+
+    // All center pixels must have equal values (symmetric around center)
+    try std.testing.expectEqual(center_tl, center_tr);
+    try std.testing.expectEqual(center_tl, center_bl);
+    try std.testing.expectEqual(center_tl, center_br);
+}
+
+test "camera center 8x8" {
+    const allocator = std.testing.allocator;
+
+    // Sphere of radius 2.0 at world origin
+    const sphere = Sphere.init(Vec3.fromArray(&.{ 0, 0, 0 }), 2.0);
+
+    // Camera at (0, 0, 5) looking at origin, 45 degree FOV, 8x8 image
+    var camera = Camera32.fromFOV(45.0, 8, 8);
+    camera.lookAt(
+        Vec3.fromArray(&.{ 0, 0, 5 }), // eye - on positive Z axis
+        Vec3.fromArray(&.{ 0, 0, 0 }), // target - origin (sphere center)
+        Vec3.fromArray(&.{ 0, 1, 0 }), // up
+    );
+
+    // Allocate image buffer
+    try camera.allocateImageBuffer(allocator);
+    defer camera.freeImageBuffer();
+
+    // Render the 8x8 image
+    for (0..camera.image_height) |y| {
+        for (0..camera.image_width) |x| {
+            const pixel_x: f32 = @floatFromInt(x);
+            const pixel_y: f32 = @floatFromInt(y);
+
+            // Generate ray for this pixel
+            const ray = camera.getRay(pixel_x, pixel_y);
+
+            // Test sphere intersection
+            if (sphere.intersectRay(ray)) |hit| {
+                // Shade based on normal
+                const light_dir = Vec3.fromArray(&.{ 0, 0, 1 }).normalized();
+                const ndotl = @max(0.0, hit.normal.dotProduct(light_dir));
+                const shade = @abs(ndotl);
+
+                const intensity: u8 = @intFromFloat(@min(255.0, 255.0 * shade));
+                camera.setPixel(@intCast(x), @intCast(y), intensity, intensity, intensity);
+            } else {
+                // Black background
+                camera.setPixel(@intCast(x), @intCast(y), 0, 0, 0);
+            }
+        }
+    }
+
+    // Save output to PPM file
+    try lit.writePPM("camera_center_8x8.ppm", camera.image_buffer.?, camera.image_width, camera.image_height);
+
+    // Helper to get pixel intensity (R channel, since grayscale R=G=B)
+    const buf = camera.image_buffer.?;
+    const getPixel = struct {
+        fn get(buffer: []u8, x: usize, y: usize, width: usize) u8 {
+            const idx = (y * width + x) * 3;
+            return buffer[idx];
+        }
+    }.get;
+
+    // Verify center 2x2 grid (pixels (3,3), (4,3), (3,4), (4,4)) are non-zero
+    const center_tl = getPixel(buf, 3, 3, 8);
+    const center_tr = getPixel(buf, 4, 3, 8);
+    const center_bl = getPixel(buf, 3, 4, 8);
+    const center_br = getPixel(buf, 4, 4, 8);
+
+    try std.testing.expect(center_tl > 0);
+    try std.testing.expect(center_tr > 0);
+    try std.testing.expect(center_bl > 0);
+    try std.testing.expect(center_br > 0);
+
+    // Verify four quadrants are symmetric
+    // For an 8x8 image centered on sphere, pixels should be symmetric across both axes
+    // Quadrant mapping: (x, y) should equal (7-x, y), (x, 7-y), and (7-x, 7-y)
+    for (0..4) |y| {
+        for (0..4) |x| {
+            const tl = getPixel(buf, x, y, 8); // top-left quadrant
+            const tr = getPixel(buf, 7 - x, y, 8); // top-right quadrant (mirrored horizontally)
+            const bl = getPixel(buf, x, 7 - y, 8); // bottom-left quadrant (mirrored vertically)
+            const br = getPixel(buf, 7 - x, 7 - y, 8); // bottom-right quadrant (mirrored both)
+
+            try std.testing.expectEqual(tl, tr);
+            try std.testing.expectEqual(tl, bl);
+            try std.testing.expectEqual(tl, br);
+        }
+    }
 }
