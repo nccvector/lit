@@ -253,3 +253,67 @@ test "basic rendering" {
     const cam = test_scene.getActiveCamera().?;
     try std.testing.expect(cam.image_buffer != null);
 }
+
+test "camera center check" {
+    const allocator = std.testing.allocator;
+
+    // Sphere of radius 1.0 at world origin
+    const sphere = Sphere.init(Vec3.fromArray(&.{ 0, 0, 0 }), 2.0);
+
+    // Camera at (5, 0, 0) looking at origin, 45 degree FOV, 3x3 image
+    var camera = Camera32.fromFOV(45.0, 8, 8);
+    camera.lookAt(
+        Vec3.fromArray(&.{ 0, 0, 5 }), // eye - on positive X axis
+        Vec3.fromArray(&.{ 0, 0, 0 }), // target - origin (sphere center)
+        Vec3.fromArray(&.{ 0, 1, 0 }), // up
+    );
+
+    // Allocate image buffer
+    try camera.allocateImageBuffer(allocator);
+    defer camera.freeImageBuffer();
+
+    // Render the 3x3 image
+    for (0..camera.image_height) |y| {
+        for (0..camera.image_width) |x| {
+            const pixel_x: f32 = @floatFromInt(x);
+            const pixel_y: f32 = @floatFromInt(y);
+
+            // Generate ray for this pixel
+            // Note: principal point is at integer coordinates (cx, cy) = ((w-1)/2, (h-1)/2)
+            const ray = camera.getRay(pixel_x, pixel_y);
+
+            // Test sphere intersection
+            if (sphere.intersectRay(ray)) |hit| {
+                // Shade based on normal (white color with normal-based shading)
+                // Light direction pointing from camera toward sphere
+                const light_dir = Vec3.fromArray(&.{ 0, 0, 1 }).normalized();
+                const ndotl = @max(0.0, hit.normal.dotProduct(light_dir));
+                const shade = @abs(ndotl);
+
+                const intensity: u8 = @intFromFloat(@min(255.0, 255.0 * shade));
+                camera.setPixel(@intCast(x), @intCast(y), intensity, intensity, intensity);
+            } else {
+                // Black background
+                camera.setPixel(@intCast(x), @intCast(y), 0, 0, 0);
+            }
+        }
+    }
+
+    // Save output to PPM file
+    try lit.writePPM("camera_center_check.ppm", camera.image_buffer.?, camera.image_width, camera.image_height);
+
+    // // Verify center ray hits the sphere
+    // // Principal point is at (cx, cy) = ((width-1)/2, (height-1)/2) = (1.0, 1.0)
+    // const center_ray = camera.getRay(1.0, 1.0);
+    // const center_hit = sphere.intersectRay(center_ray);
+    // try std.testing.expect(center_hit != null);
+
+    // // Verify ray direction is correct (should point directly at origin from camera at (5,0,0))
+    // try std.testing.expectApproxEqAbs(@as(f32, -1.0), center_ray.direction.data[0], 0.001);
+    // try std.testing.expectApproxEqAbs(@as(f32, 0.0), center_ray.direction.data[1], 0.001);
+    // try std.testing.expectApproxEqAbs(@as(f32, 0.0), center_ray.direction.data[2], 0.001);
+
+    // // Verify hit distance (camera at x=5, sphere center at origin with radius 1.0)
+    // // Expected hit distance: 5 - 1.0 = 4.0
+    // try std.testing.expectApproxEqAbs(@as(f32, 4.0), center_hit.?.t, 0.001);
+}
