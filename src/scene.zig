@@ -4,19 +4,19 @@ const chad = @import("chad");
 
 const geometry = chad.geometry;
 const octree_mod = chad.octree;
-const objloader = chad.objloader;
 
 const Vec3 = lmao.Vec3f;
 const Mat4 = lmao.Mat4f;
 const Ray = geometry.Ray;
-const RayHit = geometry.RayHit;
-const Triangle = geometry.Triangle;
 const Aabb = geometry.Aabb;
-const Mesh = geometry.Mesh;
-const Model = geometry.Model;
 const Octree = octree_mod.Octree;
 
-const Camera = @import("camera.zig").Camera32;
+/// Primitive ID type - used as key for UDBT lookups
+pub const PrimId = geometry.PrimId;
+
+/// Unique identifiers
+pub const InstanceId = u32;
+pub const CameraId = u32;
 
 /// Casting direction for ray queries
 pub const CastDirection = enum {
@@ -31,176 +31,97 @@ pub const FilterMode = enum {
     all, // Return all intersections
 };
 
-/// Unique identifiers
-pub const ModelId = u32;
-pub const InstanceId = u32;
-pub const PrimId = u32;
-pub const CameraId = u32;
-pub const LightId = u32;
+/// Result from an intersection function
+/// Returned by user-defined intersection functions
+pub const IntersectionResult = struct {
+    t: f32, // Distance along ray
+    u: f32, // First barycentric/parametric coordinate
+    v: f32, // Second barycentric/parametric coordinate
+    hit_kind: u8 = 0, // User-defined hit type (e.g., front face = 0, back face = 1)
+};
 
-pub fn HitResult(comptime UserData: type) type {
-    return struct {
-        model_id: ModelId,
-        instance_id: InstanceId,
-        mesh_idx: u32,
-        prim_id: PrimId, // Triangle index within mesh
-        t: f32, // Distance along ray
-        u: f32, // Barycentric u
-        v: f32, // Barycentric v
-        user_data: UserData, // Additional user data
+/// Hit result returned from ray casting
+/// Contains only IDs - user looks up actual data via UDBT using prim_id
+pub const HitResult = struct {
+    instance_id: InstanceId,
+    prim_id: PrimId, // Key for UDBT lookup
+    t: f32, // Distance along ray (in world space)
+    u: f32, // First barycentric/parametric coordinate
+    v: f32, // Second barycentric/parametric coordinate
+    hit_kind: u8, // User-defined hit type from intersection function
 
-        /// Compute the hit point in world space
-        pub fn hitPoint(self: HitResult, ray: Ray) Vec3 {
-            return ray.at(self.t);
-        }
+    /// Compute the hit point in world space
+    pub fn hitPoint(self: HitResult, ray: Ray) Vec3 {
+        return ray.at(self.t);
+    }
 
-        /// Get the third barycentric coordinate
-        pub fn w(self: HitResult) f32 {
-            return 1.0 - self.u - self.v;
-        }
-    };
-}
+    /// Get the third barycentric coordinate (for triangles: w = 1 - u - v)
+    pub fn w(self: HitResult) f32 {
+        return 1.0 - self.u - self.v;
+    }
+};
 
-pub fn Instance(comptime UserData: type) type {
-    return struct {
-        model_id: ModelId,
-        transform: Mat4,
-        inv_transform: Mat4,
-        bounds: Aabb, // World-space bounds
-        user_data: UserData,
-    };
-}
+/// Instance of geometry in the scene
+/// References an external BLAS (user-owned) with a transform
+pub const Instance = struct {
+    blas: *const Octree, // User-provided BLAS (not owned by scene)
+    transform: Mat4,
+    inv_transform: Mat4,
+    bounds: Aabb, // World-space bounds (for TLAS)
+};
 
-/// Bottom-Level Acceleration Structure (per-model)
-fn BLAS(comptime UserData: type) type {
+/// User Data Binding Table - maps PrimId to user-defined data
+/// Generic over the data type stored per primitive
+pub fn UserDataBindingTable(comptime T: type) type {
     return struct {
         const Self = @This();
-        const Hit = HitResult(UserData);
 
-        octree: Octree,
-        model: *const Model,
+        data: std.AutoHashMap(PrimId, T),
 
-        fn init(allocator: std.mem.Allocator, model: *const Model) !Self {
-            // Compute bounds of the model
-            var bounds = computeModelBounds(model);
-
-            // Slightly expand bounds to avoid numerical issues
-            const epsilon: @Vector(3, f32) = @splat(0.001);
-            bounds.bmin.data -= epsilon;
-            bounds.bmax.data += epsilon;
-
-            var tree = Octree.init(allocator, bounds, .{
-                .max_depth = 10,
-                .max_primitives_per_node = 8,
-            });
-
-            // Insert all triangles from all meshes
-            var global_prim_id: PrimId = 0;
-            for (model.meshes.items) |*mesh| {
-                const tri_count = mesh.triangleCount();
-                for (0..tri_count) |tri_idx| {
-                    const tri = Triangle.fromMesh(mesh, tri_idx);
-                    try tree.insert(global_prim_id, tri.bounds());
-                    global_prim_id += 1;
-                }
-            }
-
+        pub fn init(allocator: std.mem.Allocator) Self {
             return .{
-                .octree = tree,
-                .model = model,
+                .data = std.AutoHashMap(PrimId, T).init(allocator),
             };
         }
 
-        fn deinit(self: *Self) void {
-            self.octree.deinit();
+        pub fn deinit(self: *Self) void {
+            self.data.deinit();
         }
 
-        /// Ray-model intersection (in model local space)
-        fn intersect(self: *const Self, allocator: std.mem.Allocator, ray: Ray, direction: CastDirection, filter: FilterMode, results: *std.ArrayListUnmanaged(Hit), instance_id: InstanceId, model_id: ModelId, user_data: UserData) !void {
-            // Query octree for candidate primitives
-            var candidates = std.ArrayListUnmanaged(PrimId){};
-            defer candidates.deinit(self.octree.allocator);
-            try self.octree.queryRayIntersection(ray, &candidates);
+        /// Add or update data for a primitive
+        pub fn put(self: *Self, prim_id: PrimId, value: T) !void {
+            try self.data.put(prim_id, value);
+        }
 
-            // Test each candidate triangle
-            for (candidates.items) |global_prim_id| {
-                // Find which mesh and triangle this primitive belongs to
-                var mesh_idx: u32 = 0;
-                var local_tri_idx: usize = global_prim_id;
-                for (self.model.meshes.items, 0..) |*mesh, idx| {
-                    const tri_count = mesh.triangleCount();
-                    if (local_tri_idx < tri_count) {
-                        mesh_idx = @intCast(idx);
-                        break;
-                    }
-                    local_tri_idx -= tri_count;
-                }
+        /// Get data for a primitive (returns null if not found)
+        pub fn get(self: *const Self, prim_id: PrimId) ?T {
+            return self.data.get(prim_id);
+        }
 
-                const mesh = &self.model.meshes.items[mesh_idx];
-                const tri = Triangle.fromMesh(mesh, local_tri_idx);
+        /// Get pointer to data for a primitive (returns null if not found)
+        pub fn getPtr(self: *Self, prim_id: PrimId) ?*T {
+            return self.data.getPtr(prim_id);
+        }
 
-                const hit_opt: ?RayHit = switch (direction) {
-                    .forward => tri.intersectRay(ray, false),
-                    .backward => blk: {
-                        // Flip ray direction and check
-                        const flipped_ray = Ray{
-                            .origin = ray.origin,
-                            .direction = ray.direction.negate(),
-                        };
-                        if (tri.intersectRay(flipped_ray, false)) |h| {
-                            break :blk RayHit{ .t = -h.t, .u = h.u, .v = h.v };
-                        }
-                        break :blk null;
-                    },
-                    .both => tri.intersectRayBidirectional(ray),
-                };
+        /// Get const pointer to data for a primitive (returns null if not found)
+        pub fn getConstPtr(self: *const Self, prim_id: PrimId) ?*const T {
+            return self.data.getPtr(prim_id);
+        }
 
-                if (hit_opt) |hit| {
-                    const result = Hit{
-                        .model_id = model_id,
-                        .instance_id = instance_id,
-                        .mesh_idx = mesh_idx,
-                        .prim_id = @intCast(local_tri_idx),
-                        .t = hit.t,
-                        .u = hit.u,
-                        .v = hit.v,
-                        .user_data = user_data,
-                    };
+        /// Check if a primitive has data
+        pub fn contains(self: *const Self, prim_id: PrimId) bool {
+            return self.data.contains(prim_id);
+        }
 
-                    if (filter == .closest) {
-                        // Keep only closest
-                        if (results.items.len == 0 or @abs(result.t) < @abs(results.items[0].t)) {
-                            results.clearRetainingCapacity();
-                            try results.append(allocator, result);
-                        }
-                    } else {
-                        try results.append(allocator, result);
-                    }
-                }
-            }
+        /// Remove data for a primitive
+        pub fn remove(self: *Self, prim_id: PrimId) bool {
+            return self.data.remove(prim_id);
         }
     };
-}
-
-/// Compute the axis-aligned bounding box of a model
-fn computeModelBounds(model: *const Model) Aabb {
-    var bmin = Vec3.fromArray(&.{ std.math.inf(f32), std.math.inf(f32), std.math.inf(f32) });
-    var bmax = Vec3.fromArray(&.{ -std.math.inf(f32), -std.math.inf(f32), -std.math.inf(f32) });
-
-    for (model.meshes.items) |*mesh| {
-        for (mesh.vertices) |v| {
-            const vert = Vec3.fromArray(&v);
-            bmin = bmin.min(vert);
-            bmax = bmax.max(vert);
-        }
-    }
-
-    return .{ .bmin = bmin, .bmax = bmax };
 }
 
 /// Transform an AABB by a matrix (returns a conservative AABB)
 fn transformAabb(bounds: Aabb, transform: Mat4) Aabb {
-    // Get the 8 corners of the AABB
     const min = bounds.bmin.toArray();
     const max = bounds.bmax.toArray();
 
@@ -222,100 +143,63 @@ fn transformAabb(bounds: Aabb, transform: Mat4) Aabb {
     return .{ .bmin = new_min, .bmax = new_max };
 }
 
-/// The main Scene struct - parameterized by UserData type for stack-based hit results
-pub fn Scene(comptime UserData: type) type {
+/// Comptime-parameterized Scene
+/// The intersection function and UDBT type are known at compile time,
+/// allowing full inlining of intersection logic.
+///
+/// Parameters:
+///   - UserData: The type stored in the UDBT for each primitive
+///   - intersectFn: Compile-time known intersection function
+///
+/// Example:
+/// ```zig
+/// const MyScene = Scene(GeometryData, geometryIntersect);
+/// var scene = MyScene.init(allocator, &udbt);
+/// ```
+pub fn Scene(
+    comptime UserData: type,
+    comptime intersectFn: fn (ray: Ray, prim_id: PrimId, udbt: *const UserDataBindingTable(UserData)) ?IntersectionResult,
+) type {
     return struct {
         const Self = @This();
-        pub const Hit = HitResult(UserData);
-        pub const Inst = Instance(UserData);
-        const BlasType = BLAS(UserData);
+        const UDBT = UserDataBindingTable(UserData);
 
         allocator: std.mem.Allocator,
 
-        // Model storage (templates)
-        models: std.ArrayListUnmanaged(Model) = .empty,
-        blas_list: std.ArrayListUnmanaged(BlasType) = .empty,
+        /// Instances referencing external BLAS structures
+        instances: std.ArrayListUnmanaged(Instance) = .empty,
 
-        // Instance storage
-        instances: std.ArrayListUnmanaged(Inst) = .empty,
-
-        // Top-Level Acceleration Structure
+        /// Top-Level Acceleration Structure (over instances)
         tlas: ?Octree = null,
 
-        // Cameras
-        cameras: std.ArrayListUnmanaged(Camera) = .empty,
-        active_camera_id: ?CameraId = null,
+        /// User Data Binding Table - provided by user
+        udbt: *const UDBT,
 
-        pub fn init(allocator: std.mem.Allocator) Self {
+        pub fn init(allocator: std.mem.Allocator, udbt: *const UDBT) Self {
             return .{
                 .allocator = allocator,
+                .udbt = udbt,
             };
         }
 
         pub fn deinit(self: *Self) void {
-            // Free TLAS
             if (self.tlas) |*tlas| {
                 tlas.deinit();
             }
-
-            // Free BLAS
-            for (self.blas_list.items) |*blas| {
-                blas.deinit();
-            }
-            self.blas_list.deinit(self.allocator);
-
-            // Free models
-            for (self.models.items) |*model| {
-                model.deinit();
-            }
-            self.models.deinit(self.allocator);
-
-            // Free instances
             self.instances.deinit(self.allocator);
-
-            // Free cameras (and their image buffers)
-            for (self.cameras.items) |*cam| {
-                cam.freeImageBuffer();
-            }
-            self.cameras.deinit(self.allocator);
         }
 
-        /// Load an OBJ model from file and add it to the scene
-        pub fn loadOBJ(self: *Self, path: []const u8, scale: ?f32) !ModelId {
-            const model = try objloader.ObjLoader.loadModel(self.allocator, path, scale orelse 1.0);
-            return self.addModel(model);
-        }
-
-        /// Add a model to the scene (takes ownership)
-        pub fn addModel(self: *Self, model: Model) !ModelId {
-            const model_id: ModelId = @intCast(self.models.items.len);
-            try self.models.append(self.allocator, model);
-
-            // Build BLAS for this model
-            const blas = try BlasType.init(self.allocator, &self.models.items[model_id]);
-            try self.blas_list.append(self.allocator, blas);
-
-            return model_id;
-        }
-
-        /// Create an instance of a model with the given transform and user data
-        pub fn instantiate(self: *Self, model_id: ModelId, transform: Mat4, user_data: UserData) !InstanceId {
-            if (model_id >= self.models.items.len) {
-                return error.InvalidModelId;
-            }
-
-            const model = &self.models.items[model_id];
-            const model_bounds = computeModelBounds(model);
-            const world_bounds = transformAabb(model_bounds, transform);
-
+        /// Add an instance to the scene
+        /// The BLAS must outlive the scene (user-owned)
+        pub fn addInstance(self: *Self, blas: *const Octree, transform: Mat4) !InstanceId {
+            const world_bounds = transformAabb(blas.root.bounds, transform);
             const inv_transform = transform.inverse() orelse Mat4.identity();
 
-            const instance = Inst{
-                .model_id = model_id,
+            const instance = Instance{
+                .blas = blas,
                 .transform = transform,
                 .inv_transform = inv_transform,
                 .bounds = world_bounds,
-                .user_data = user_data,
             };
 
             const instance_id: InstanceId = @intCast(self.instances.items.len);
@@ -337,12 +221,9 @@ pub fn Scene(comptime UserData: type) type {
             }
 
             var instance = &self.instances.items[instance_id];
-            const model = &self.models.items[instance.model_id];
-            const model_bounds = computeModelBounds(model);
-
             instance.transform = transform;
             instance.inv_transform = transform.inverse() orelse Mat4.identity();
-            instance.bounds = transformAabb(model_bounds, transform);
+            instance.bounds = transformAabb(instance.blas.root.bounds, transform);
 
             // Invalidate TLAS
             if (self.tlas) |*tlas| {
@@ -351,8 +232,16 @@ pub fn Scene(comptime UserData: type) type {
             }
         }
 
+        /// Get instance by ID
+        pub fn getInstance(self: *const Self, instance_id: InstanceId) ?*const Instance {
+            if (instance_id >= self.instances.items.len) {
+                return null;
+            }
+            return &self.instances.items[instance_id];
+        }
+
         /// Build or rebuild the Top-Level Acceleration Structure
-        pub fn buildAccelerationStructure(self: *Self) !void {
+        pub fn buildTLAS(self: *Self) !void {
             if (self.tlas) |*tlas| {
                 tlas.deinit();
             }
@@ -389,49 +278,19 @@ pub fn Scene(comptime UserData: type) type {
             self.tlas = tlas;
         }
 
-        /// Add a camera to the scene
-        pub fn addCamera(self: *Self, cam: Camera) !CameraId {
-            const camera_id: CameraId = @intCast(self.cameras.items.len);
-            try self.cameras.append(self.allocator, cam);
-
-            // Set as active if first camera
-            if (self.active_camera_id == null) {
-                self.active_camera_id = camera_id;
-            }
-
-            return camera_id;
-        }
-
-        /// Set the active camera
-        pub fn setActiveCamera(self: *Self, camera_id: CameraId) !void {
-            if (camera_id >= self.cameras.items.len) {
-                return error.InvalidCameraId;
-            }
-            self.active_camera_id = camera_id;
-        }
-
-        /// Get the active camera
-        pub fn getActiveCamera(self: *Self) ?*Camera {
-            if (self.active_camera_id) |id| {
-                if (id < self.cameras.items.len) {
-                    return &self.cameras.items[id];
-                }
-            }
-            return null;
-        }
-
-        /// Cast a ray and append hit results to the provided list
-        /// Caller owns and manages the results list
+        /// Cast a ray and collect hit results
+        /// Results are appended to the provided list (caller owns the list)
+        /// The intersection function is inlined at compile time for maximum performance.
         pub fn castRay(
             self: *Self,
             ray: Ray,
             direction: CastDirection,
             filter: FilterMode,
-            results: *std.ArrayListUnmanaged(Hit),
+            results: *std.ArrayListUnmanaged(HitResult),
         ) !void {
             // Ensure TLAS is built
             if (self.tlas == null) {
-                try self.buildAccelerationStructure();
+                try self.buildTLAS();
             }
 
             const tlas = self.tlas orelse return;
@@ -444,9 +303,8 @@ pub fn Scene(comptime UserData: type) type {
             // Test each candidate instance
             for (candidate_instances.items) |instance_id| {
                 const instance = &self.instances.items[instance_id];
-                const blas = &self.blas_list.items[instance.model_id];
 
-                // Transform ray to model local space
+                // Transform ray to BLAS local space
                 const local_origin = instance.inv_transform.transformPoint(ray.origin);
                 const local_dir = instance.inv_transform.transformDirection(ray.direction).normalized();
                 const local_ray = Ray{
@@ -454,20 +312,86 @@ pub fn Scene(comptime UserData: type) type {
                     .direction = local_dir,
                 };
 
-                // Intersect with BLAS, passing the instance's user_data
-                try blas.intersect(self.allocator, local_ray, direction, filter, results, instance_id, instance.model_id, instance.user_data);
+                // Query BLAS for candidate primitives
+                var candidate_prims = std.ArrayListUnmanaged(PrimId){};
+                defer candidate_prims.deinit(self.allocator);
+                try instance.blas.queryRayIntersection(local_ray, &candidate_prims);
+
+                // Test each candidate primitive using comptime-known intersection function
+                for (candidate_prims.items) |prim_id| {
+                    // Call intersection function (inlined at compile time)
+                    const intersection_result: ?IntersectionResult = switch (direction) {
+                        .forward => intersectFn(local_ray, prim_id, self.udbt),
+                        .backward => blk: {
+                            const flipped_ray = Ray{
+                                .origin = local_ray.origin,
+                                .direction = local_ray.direction.negate(),
+                            };
+                            if (intersectFn(flipped_ray, prim_id, self.udbt)) |res| {
+                                break :blk IntersectionResult{
+                                    .t = -res.t,
+                                    .u = res.u,
+                                    .v = res.v,
+                                    .hit_kind = res.hit_kind,
+                                };
+                            }
+                            break :blk null;
+                        },
+                        .both => blk: {
+                            // Try forward first
+                            if (intersectFn(local_ray, prim_id, self.udbt)) |res| {
+                                break :blk res;
+                            }
+                            // Try backward
+                            const flipped_ray = Ray{
+                                .origin = local_ray.origin,
+                                .direction = local_ray.direction.negate(),
+                            };
+                            if (intersectFn(flipped_ray, prim_id, self.udbt)) |res| {
+                                break :blk IntersectionResult{
+                                    .t = -res.t,
+                                    .u = res.u,
+                                    .v = res.v,
+                                    .hit_kind = res.hit_kind,
+                                };
+                            }
+                            break :blk null;
+                        },
+                    };
+
+                    if (intersection_result) |isect| {
+                        const hit = HitResult{
+                            .instance_id = instance_id,
+                            .prim_id = prim_id,
+                            .t = isect.t,
+                            .u = isect.u,
+                            .v = isect.v,
+                            .hit_kind = isect.hit_kind,
+                        };
+
+                        if (filter == .closest) {
+                            // Keep only closest
+                            if (results.items.len == 0 or @abs(hit.t) < @abs(results.items[0].t)) {
+                                results.clearRetainingCapacity();
+                                try results.append(self.allocator, hit);
+                            }
+                        } else {
+                            try results.append(self.allocator, hit);
+                        }
+                    }
+                }
             }
 
             // Sort by distance if returning all
             if (filter == .all and results.items.len > 1) {
-                std.mem.sort(Hit, results.items, {}, struct {
-                    fn lessThan(_: void, a: Hit, b: Hit) bool {
+                std.mem.sort(HitResult, results.items, {}, struct {
+                    fn lessThan(_: void, a: HitResult, b: HitResult) bool {
                         return @abs(a.t) < @abs(b.t);
                     }
                 }.lessThan);
             }
 
-            // For closest filter with multiple results, keep only the closest
+            // For closest filter with multiple results from different instances, keep only the closest
             if (filter == .closest and results.items.len > 1) {
                 var closest_idx: usize = 0;
                 var closest_t = @abs(results.items[0].t);
@@ -482,103 +406,113 @@ pub fn Scene(comptime UserData: type) type {
                 try results.append(self.allocator, closest);
             }
         }
-
-        /// Get triangle normal at a hit point
-        pub fn getHitNormal(self: *const Self, hit: Hit) Vec3 {
-            const instance = &self.instances.items[hit.instance_id];
-            const model = &self.models.items[hit.model_id];
-            const mesh = &model.meshes.items[hit.mesh_idx];
-            const tri = Triangle.fromMesh(mesh, hit.prim_id);
-
-            // Get local normal and transform to world space
-            const local_normal = tri.normalNormalized();
-            const world_normal = instance.transform.transformDirection(local_normal).normalized();
-
-            return world_normal;
-        }
-
-        /// Render the scene to the active camera's image buffer
-        pub fn render(self: *Self) !void {
-            const camera = self.getActiveCamera() orelse return error.NoActiveCamera;
-
-            // Allocate image buffer if not already allocated
-            if (camera.image_buffer == null) {
-                try camera.allocateImageBuffer(self.allocator);
-            }
-
-            // Ensure acceleration structure is built
-            if (self.tlas == null) {
-                try self.buildAccelerationStructure();
-            }
-
-            // Reusable hit results buffer
-            var hits = std.ArrayListUnmanaged(Hit){};
-            defer hits.deinit(self.allocator);
-
-            // Render each pixel
-            for (0..camera.image_height) |y| {
-                for (0..camera.image_width) |x| {
-                    const pixel_x: f32 = @floatFromInt(x);
-                    const pixel_y: f32 = @floatFromInt(y);
-
-                    // Generate ray for this pixel (center of pixel)
-                    const ray = camera.getRay(pixel_x + 0.5, pixel_y + 0.5);
-
-                    // Cast ray (reuse buffer)
-                    hits.clearRetainingCapacity();
-                    try self.castRay(ray, .forward, .closest, &hits);
-
-                    // Shade the pixel
-                    var r: u8 = 0;
-                    var g: u8 = 0;
-                    var b: u8 = 0;
-
-                    if (hits.items.len > 0) {
-                        const hit = hits.items[0];
-                        const normal = self.getHitNormal(hit);
-
-                        // Simple normal visualization (map [-1,1] to [0,255])
-                        r = @intFromFloat(@max(0, @min(255, (normal.data[0] * 0.5 + 0.5) * 255)));
-                        g = @intFromFloat(@max(0, @min(255, (normal.data[1] * 0.5 + 0.5) * 255)));
-                        b = @intFromFloat(@max(0, @min(255, (normal.data[2] * 0.5 + 0.5) * 255)));
-                    }
-
-                    camera.setPixel(@intCast(x), @intCast(y), r, g, b);
-                }
-            }
-        }
     };
 }
 
+// ============================================================================
 // Tests
-test "scene basic operations" {
+// ============================================================================
+
+test "UserDataBindingTable basic operations" {
     const allocator = std.testing.allocator;
 
-    // Use void for simple scenes with no user data
-    const SimpleScene = Scene(void);
-    var my_scene = SimpleScene.init(allocator);
-    defer my_scene.deinit();
-
-    // Create a simple triangle model
-    var model = Model.init(allocator);
-    const vertices = [_][3]f32{
-        .{ -1.0, -1.0, 0.0 },
-        .{ 1.0, -1.0, 0.0 },
-        .{ 0.0, 1.0, 0.0 },
+    const SphereData = struct {
+        center: [3]f32,
+        radius: f32,
     };
-    const indices = [_]u32{ 0, 1, 2 };
-    const mesh = try Mesh.initCopy(allocator, &vertices, &indices);
-    try model.addMesh(mesh);
 
-    // Add model to scene
-    const model_id = try my_scene.addModel(model);
-    try std.testing.expectEqual(@as(ModelId, 0), model_id);
+    var udbt = UserDataBindingTable(SphereData).init(allocator);
+    defer udbt.deinit();
 
-    // Create an instance with void user data
-    const instance_id = try my_scene.instantiate(model_id, Mat4.identity(), {});
-    try std.testing.expectEqual(@as(InstanceId, 0), instance_id);
+    // Add some data
+    try udbt.put(0, .{ .center = .{ 0, 0, 0 }, .radius = 1.0 });
+    try udbt.put(1, .{ .center = .{ 2, 0, 0 }, .radius = 0.5 });
 
-    // Build acceleration structure
-    try my_scene.buildAccelerationStructure();
-    try std.testing.expect(my_scene.tlas != null);
+    // Retrieve data
+    const sphere0 = udbt.get(0).?;
+    try std.testing.expectEqual(@as(f32, 1.0), sphere0.radius);
+
+    const sphere1 = udbt.get(1).?;
+    try std.testing.expectEqual(@as(f32, 0.5), sphere1.radius);
+
+    // Non-existent
+    try std.testing.expect(udbt.get(99) == null);
+}
+
+test "Scene with comptime intersection" {
+    const allocator = std.testing.allocator;
+
+    // Simple sphere data
+    const SphereData = struct {
+        center: Vec3,
+        radius: f32,
+    };
+
+    // User data binding table
+    var udbt_table = UserDataBindingTable(SphereData).init(allocator);
+    defer udbt_table.deinit();
+
+    try udbt_table.put(0, .{ .center = Vec3.fromArray(&.{ 0, 0, 0 }), .radius = 1.0 });
+
+    // Sphere intersection function (comptime known)
+    const sphereIntersect = struct {
+        fn func(ray: Ray, prim_id: PrimId, udbt: *const UserDataBindingTable(SphereData)) ?IntersectionResult {
+            const sphere = udbt.get(prim_id) orelse return null;
+
+            // Ray-sphere intersection
+            const oc = ray.origin.sub(sphere.center);
+            const dir = ray.direction;
+            const a = dir.dotProduct(dir);
+            const b = 2.0 * oc.dotProduct(dir);
+            const c = oc.dotProduct(oc) - sphere.radius * sphere.radius;
+            const discriminant = b * b - 4.0 * a * c;
+
+            if (discriminant < 0) return null;
+
+            const t = (-b - @sqrt(discriminant)) / (2.0 * a);
+            if (t < 0) return null;
+
+            return .{ .t = t, .u = 0, .v = 0, .hit_kind = 0 };
+        }
+    }.func;
+
+    // Create scene with comptime-known intersection function
+    const MyScene = Scene(SphereData, sphereIntersect);
+
+    // Build BLAS (just an octree with the sphere's AABB)
+    var blas = Octree.init(allocator, .{
+        .bmin = Vec3.fromArray(&.{ -2, -2, -2 }),
+        .bmax = Vec3.fromArray(&.{ 2, 2, 2 }),
+    }, .{});
+    defer blas.deinit();
+
+    try blas.insert(0, .{
+        .bmin = Vec3.fromArray(&.{ -1, -1, -1 }),
+        .bmax = Vec3.fromArray(&.{ 1, 1, 1 }),
+    });
+
+    // Create scene
+    var scene = MyScene.init(allocator, &udbt_table);
+    defer scene.deinit();
+
+    // Add instance
+    _ = try scene.addInstance(&blas, Mat4.identity());
+    try scene.buildTLAS();
+
+    // Cast ray
+    var results = std.ArrayListUnmanaged(HitResult){};
+    defer results.deinit(allocator);
+
+    const ray = Ray{
+        .origin = Vec3.fromArray(&.{ 0, 0, -5 }),
+        .direction = Vec3.fromArray(&.{ 0, 0, 1 }),
+    };
+
+    try scene.castRay(ray, .forward, .closest, &results);
+
+    try std.testing.expectEqual(@as(usize, 1), results.items.len);
+    try std.testing.expectEqual(@as(PrimId, 0), results.items[0].prim_id);
+
+    // t should be approximately 4.0 (ray starts at z=-5, sphere surface at z=-1)
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), results.items[0].t, 0.001);
 }

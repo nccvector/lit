@@ -1,41 +1,42 @@
-//! lit - A high-performance raytracing library for computer vision research
+//! lit - A geometry-agnostic raytracing library
 //!
-//! This library provides:
-//! - Flexible camera models with intrinsic matrix computation
-//! - Scene management with model loading and instancing
-//! - Two-level acceleration structures (TLAS/BLAS) using octrees
-//! - Ray casting with configurable direction and filtering
-//! - PPM image output
+//! This library provides an OptiX-inspired raytracing architecture:
+//! - Geometry-agnostic scene with TLAS (top-level acceleration structure)
+//! - User-provided BLAS (bottom-level acceleration structure) per object
+//! - Comptime-known intersection functions for maximum performance (inlined)
+//! - User Data Binding Table (UDBT) maps primitive IDs to custom data
 //!
 //! Example usage:
 //! ```zig
 //! const lit = @import("lit");
 //!
-//! // Create a scene
-//! var scene = lit.Scene.init(allocator);
-//! defer scene.deinit();
+//! // Define your primitive data
+//! const SphereData = struct { center: lit.Vec3, radius: f32 };
 //!
-//! // Load a model
-//! const model_id = try scene.loadOBJ("model.obj", 1.0);
+//! // Create UDBT with per-primitive data
+//! var udbt = lit.UserDataBindingTable(SphereData).init(allocator);
+//! try udbt.put(0, .{ .center = lit.Vec3.zero(), .radius = 1.0 });
 //!
-//! // Create an instance
-//! _ = try scene.instantiate(model_id, lit.Mat4.identity());
+//! // Define intersection function (comptime known)
+//! fn sphereIntersect(ray: lit.Ray, prim_id: lit.PrimId, udbt: *const lit.UserDataBindingTable(SphereData)) ?lit.IntersectionResult {
+//!     const sphere = udbt.get(prim_id) orelse return null;
+//!     // ... intersection math ...
+//! }
 //!
-//! // Add a camera
-//! var camera = lit.Camera.fromFOV(60.0, 640, 480);
-//! camera.lookAt(
-//!     lit.Vec3.fromArray(&.{0, 0, 5}),
-//!     lit.Vec3.fromArray(&.{0, 0, 0}),
-//!     lit.Vec3.fromArray(&.{0, 1, 0}),
-//! );
-//! _ = try scene.addCamera(camera);
+//! // Create Scene type with comptime intersection function
+//! const MyScene = lit.Scene(SphereData, sphereIntersect);
 //!
-//! // Render
-//! try scene.render();
+//! // Build BLAS (octree with primitive AABBs)
+//! var blas = lit.Octree.init(allocator, bounds, .{});
+//! try blas.insert(0, sphere_aabb);
 //!
-//! // Save output
-//! const cam = scene.getActiveCamera().?;
-//! try lit.image.writePPM("output.ppm", cam.image_buffer.?, cam.image_width, cam.image_height);
+//! // Create scene and add instance
+//! var scene = MyScene.init(allocator, &udbt);
+//! _ = try scene.addInstance(&blas, lit.Mat4.identity());
+//!
+//! // Cast rays
+//! var hits = std.ArrayListUnmanaged(lit.HitResult){};
+//! try scene.castRay(ray, .forward, .closest, &hits);
 //! ```
 
 const std = @import("std");
@@ -75,6 +76,9 @@ pub const Cylinder = chad.geometry.Cylinder;
 pub const Cone = chad.geometry.Cone;
 pub const Pyramid = chad.geometry.Pyramid;
 
+// Octree (for building BLAS)
+pub const Octree = chad.octree.Octree;
+
 // lit modules
 pub const camera = @import("camera.zig");
 pub const scene = @import("scene.zig");
@@ -86,15 +90,20 @@ pub const Camera16 = camera.Camera16;
 pub const Camera32 = camera.Camera32;
 pub const Camera64 = camera.Camera64;
 
+// Scene types (comptime-parameterized)
 pub const Scene = scene.Scene;
 pub const CastDirection = scene.CastDirection;
 pub const FilterMode = scene.FilterMode;
 pub const HitResult = scene.HitResult;
 pub const Instance = scene.Instance;
-pub const ModelId = scene.ModelId;
 pub const InstanceId = scene.InstanceId;
-pub const CameraId = scene.CameraId;
+pub const PrimId = scene.PrimId;
 
+// UDBT and intersection result
+pub const UserDataBindingTable = scene.UserDataBindingTable;
+pub const IntersectionResult = scene.IntersectionResult;
+
+// Image utilities
 pub const ImageBuffer = image.ImageBuffer;
 pub const writePPM = image.writePPM;
 pub const writePPMAscii = image.writePPMAscii;
