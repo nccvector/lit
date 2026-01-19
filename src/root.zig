@@ -90,6 +90,7 @@ pub const Scene = scene.Scene;
 pub const CastDirection = scene.CastDirection;
 pub const FilterMode = scene.FilterMode;
 pub const HitResult = scene.HitResult;
+pub const Instance = scene.Instance;
 pub const ModelId = scene.ModelId;
 pub const InstanceId = scene.InstanceId;
 pub const CameraId = scene.CameraId;

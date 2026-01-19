@@ -3,9 +3,11 @@ const lit = @import("lit");
 
 const Vec3 = lit.Vec3;
 const Mat4 = lit.Mat4;
-const Scene = lit.Scene;
 const Camera32 = lit.Camera32;
 const Ray = lit.Ray;
+
+// Scene with void user data (no custom data needed)
+const Scene = lit.Scene(void);
 
 // Primitives
 const Sphere = lit.Sphere;
@@ -39,7 +41,7 @@ pub fn main() !void {
             continue;
         };
         std.debug.print("Loaded model: {s}\n", .{model_path});
-        _ = try scene.instantiate(model_id, Mat4.identity());
+        _ = try scene.instantiate(model_id, Mat4.identity(), {});
         has_bunny = true;
         break;
     }
@@ -240,7 +242,7 @@ test "basic rendering" {
     try model.addMesh(mesh);
 
     const model_id = try test_scene.addModel(model);
-    _ = try test_scene.instantiate(model_id, Mat4.identity());
+    _ = try test_scene.instantiate(model_id, Mat4.identity(), {});
 
     // Setup camera
     const test_camera = Camera32.fromFOV(90.0, 64, 64);
