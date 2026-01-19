@@ -226,8 +226,8 @@ fn transformAabb(bounds: Aabb, transform: Mat4) Aabb {
 pub fn Scene(comptime UserData: type) type {
     return struct {
         const Self = @This();
-        const Hit = HitResult(UserData);
-        const Inst = Instance(UserData);
+        pub const Hit = HitResult(UserData);
+        pub const Inst = Instance(UserData);
         const BlasType = BLAS(UserData);
 
         allocator: std.mem.Allocator,
@@ -420,22 +420,21 @@ pub fn Scene(comptime UserData: type) type {
             return null;
         }
 
-        /// Cast a ray and return hit results
-        /// Caller must call results.deinit(allocator) when done
+        /// Cast a ray and append hit results to the provided list
+        /// Caller owns and manages the results list
         pub fn castRay(
             self: *Self,
             ray: Ray,
             direction: CastDirection,
             filter: FilterMode,
-        ) !std.ArrayListUnmanaged(Hit) {
-            var results = std.ArrayListUnmanaged(Hit){};
-
+            results: *std.ArrayListUnmanaged(Hit),
+        ) !void {
             // Ensure TLAS is built
             if (self.tlas == null) {
                 try self.buildAccelerationStructure();
             }
 
-            const tlas = self.tlas orelse return results;
+            const tlas = self.tlas orelse return;
 
             // Query TLAS for candidate instances
             var candidate_instances = std.ArrayListUnmanaged(PrimId){};
@@ -456,7 +455,7 @@ pub fn Scene(comptime UserData: type) type {
                 };
 
                 // Intersect with BLAS, passing the instance's user_data
-                try blas.intersect(self.allocator, local_ray, direction, filter, &results, instance_id, instance.model_id, instance.user_data);
+                try blas.intersect(self.allocator, local_ray, direction, filter, results, instance_id, instance.model_id, instance.user_data);
             }
 
             // Sort by distance if returning all
@@ -482,8 +481,6 @@ pub fn Scene(comptime UserData: type) type {
                 results.clearRetainingCapacity();
                 try results.append(self.allocator, closest);
             }
-
-            return results;
         }
 
         /// Get triangle normal at a hit point
@@ -514,6 +511,10 @@ pub fn Scene(comptime UserData: type) type {
                 try self.buildAccelerationStructure();
             }
 
+            // Reusable hit results buffer
+            var hits = std.ArrayListUnmanaged(Hit){};
+            defer hits.deinit(self.allocator);
+
             // Render each pixel
             for (0..camera.image_height) |y| {
                 for (0..camera.image_width) |x| {
@@ -523,9 +524,9 @@ pub fn Scene(comptime UserData: type) type {
                     // Generate ray for this pixel (center of pixel)
                     const ray = camera.getRay(pixel_x + 0.5, pixel_y + 0.5);
 
-                    // Cast ray
-                    var hits = try self.castRay(ray, .forward, .closest);
-                    defer hits.deinit(self.allocator);
+                    // Cast ray (reuse buffer)
+                    hits.clearRetainingCapacity();
+                    try self.castRay(ray, .forward, .closest, &hits);
 
                     // Shade the pixel
                     var r: u8 = 0;

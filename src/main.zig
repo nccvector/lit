@@ -93,6 +93,11 @@ pub fn main() !void {
     std.debug.print("Rendering...\n", .{});
     const start_time = std.time.milliTimestamp();
 
+    // Reusable hit results buffer
+    const HitResult = Scene.Hit;
+    var hits = std.ArrayListUnmanaged(HitResult){};
+    defer hits.deinit(allocator);
+
     for (0..camera.image_height) |y| {
         for (0..camera.image_width) |x| {
             const pixel_x: f32 = @floatFromInt(x);
@@ -107,8 +112,8 @@ pub fn main() !void {
 
             // Test mesh models (bunny)
             if (has_bunny) {
-                var hits = try scene.castRay(ray, .forward, .closest);
-                defer hits.deinit(allocator);
+                hits.clearRetainingCapacity();
+                try scene.castRay(ray, .forward, .closest, &hits);
 
                 if (hits.items.len > 0) {
                     const hit = hits.items[0];
